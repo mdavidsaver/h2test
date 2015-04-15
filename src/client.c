@@ -39,7 +39,9 @@ static
 void cleanup_session(void)
 {
     nghttp2_session_del(client.h2sess);
-    bufferevent_free(client.bev);
+    client.h2sess = NULL;
+    if(client.bev) bufferevent_free(client.bev);
+    client.bev = NULL;
     if(client.running)
         event_base_loopexit(client.base, NULL);
 }
