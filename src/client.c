@@ -24,201 +24,149 @@
 #include <nghttp2/nghttp2.h>
 
 #include "util.h"
+#include "h2transport.h"
 
 static struct {
+    h2session S; /* must be first */
     unsigned int running:1;
     struct event_base *base;
     struct evdns_base *dns;
-    struct bufferevent *bev;
-    nghttp2_session *h2sess;
-    int32_t streamid;
+    h2stream *stream;
     char *path;
 } client;
 
 static
-void cleanup_session(void)
+void cleanup_session(h2session *h2sess)
 {
-    nghttp2_session_del(client.h2sess);
-    client.h2sess = NULL;
-    if(client.bev) bufferevent_free(client.bev);
-    client.bev = NULL;
+    assert(&client.S==h2sess);
+    nghttp2_session_del(client.S.h2sess);
+    client.S.h2sess = NULL;
+    if(client.S.bev) bufferevent_free(client.S.bev);
+    client.S.bev = NULL;
     if(client.running)
         event_base_loopexit(client.base, NULL);
 }
-static
-int response_begin(nghttp2_session *h2sess,
-                  const nghttp2_frame *frame,
-                  void *raw)
-{
-    printf("Response headers begin\n");
-    return 0;
-}
 
 static
-int response_end(nghttp2_session *h2sess, int32_t streamid,
-                uint32_t error_code, void *raw)
+int sockconnect(h2session *h2sess)
 {
-    printf("Response ends\n");
-    nghttp2_session_terminate_session(client.h2sess, NGHTTP2_NO_ERROR);
-    event_base_loopexit(client.base, NULL);
-    return 0;
-}
+    nghttp2_option *option;
+    nghttp2_session_callbacks *callbacks;
 
-static
-int on_header_callback(nghttp2_session *session,
-                       const nghttp2_frame *frame, const uint8_t *name,
-                       size_t namelen, const uint8_t *value,
-                       size_t valuelen, uint8_t flags,
-                       void *user_data)
-{
-    printf("Header: %s: %s\n", name, value);
-    return 0;
-}
+    assert(&client.S==h2sess);
+    assert(client.S.h2sess==NULL);
 
-static int on_frame_recv_callback(nghttp2_session *session,
-                                  const nghttp2_frame *frame, void *user_data)
-{
+    nghttp2_option_new(&option);
+    nghttp2_session_callbacks_new(&callbacks);
 
-    if(frame->hd.type==NGHTTP2_HEADERS && frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) {
-        printf("End of headers\n");
-    }
-    return 0;
-}
+    h2session_setup_h2(&client.S, callbacks, option);
 
-/* move data from nghttp2's send queue into bufferevent's TX queue */
-static
-ssize_t send_sess_data(nghttp2_session *h2sess,
-                       const uint8_t *data, size_t length,
-                       int flags, void *raw)
-{
-    struct evbuffer *buf = bufferevent_get_output(client.bev);
+    if(nghttp2_session_client_new2(&client.S.h2sess, callbacks, &client.S, option)) {
+        fprintf(stderr, "Failed to create client session\n");
+        bufferevent_free(client.S.bev);
+    } else {
+        bufferevent_enable(client.S.bev, EV_READ);
 
-    assert(client.h2sess==h2sess);
+        nghttp2_settings_entry iv[] = {
+            {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
+            {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
+        };
+        int rv;
 
-    if(evbuffer_add(buf, data, length)) {
-        fprintf(stderr, "send_sess_data error\n");
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
+        bufferevent_write(client.S.bev, NGHTTP2_CLIENT_CONNECTION_PREFACE,
+                          NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
 
-    printf("Tx %lu '", (unsigned long)length);
-    fprintf_bytes(stdout, data, length);
-    printf("'\n");
-    return length;
-}
-
-/* Move data from bufferevent's RX queue to the NGHTTP2 sesssions input queue */
-static
-void sockread(struct bufferevent *bev, void *raw)
-{
-    struct evbuffer *buf = bufferevent_get_input(bev);
-    size_t blen = evbuffer_get_length(buf);
-    unsigned char *cbuf = evbuffer_pullup(buf, -1);
-    ssize_t ret;
-
-    assert(client.h2sess);
-
-    if(!cbuf) {
-        fprintf(stderr, "buf too long! %lu\n", (unsigned long)blen);
-        return;
-    }
-
-    ret = nghttp2_session_mem_recv(client.h2sess, cbuf, blen);
-    printf("Rx %lu '", (unsigned long)blen);
-    fprintf_bytes(stdout, cbuf, blen);
-    printf("'\n");
-    evbuffer_drain(buf, blen);
-
-    if(ret<0) {
-        fprintf(stderr, "recv error %s\n", nghttp2_strerror(ret));
-        cleanup_session();
-        return;
-
-    }
-    if(nghttp2_session_send(client.h2sess)) {
-        fprintf(stderr, "send after recv error\n");
-        cleanup_session();
-    }
-}
-
-static
-void sockevent(struct bufferevent *bev, short what, void *raw)
-{
-    if(what&BEV_EVENT_CONNECTED) {
-        printf("Connected\n");
-        nghttp2_option *option;
-        nghttp2_session_callbacks *callbacks;
-
-        nghttp2_option_new(&option);
-        nghttp2_session_callbacks_new(&callbacks);
-
-        nghttp2_option_set_recv_client_preface(option, 1);
-
-        nghttp2_session_callbacks_set_send_callback(callbacks, send_sess_data);
-
-        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
-        nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, response_begin);
-        nghttp2_session_callbacks_set_on_header_callback(callbacks, on_header_callback);
-        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, response_end);
-
-        if(nghttp2_session_client_new2(&client.h2sess, callbacks, NULL, option)) {
-            fprintf(stderr, "Failed to create client session\n");
-            bufferevent_free(client.bev);
+        rv = nghttp2_submit_settings(client.S.h2sess, NGHTTP2_FLAG_NONE, iv,
+                                     ARRLEN(iv));
+        if (rv != 0) {
+            printf("failed to submit settings: %s", nghttp2_strerror(rv));
+            cleanup_session(h2sess);
         } else {
-            bufferevent_enable(client.bev, EV_READ);
 
-            nghttp2_settings_entry iv[] = {
-                {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
-                {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
-            };
-            int rv;
+            nghttp2_nv hdrs[] = {
+                MAKE_NV(":method", "GET"),
+                MAKE_NV(":scheme", "http"),
+                MAKE_NV(":authority", "localhost"),
+                MAKE_NV(":path", "/")};
 
-            bufferevent_write(client.bev, NGHTTP2_CLIENT_CONNECTION_PREFACE,
-                              NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
-
-            rv = nghttp2_submit_settings(client.h2sess, NGHTTP2_FLAG_NONE, iv,
-                                         ARRLEN(iv));
-            if (rv != 0) {
-                printf("failed to submit settings: %s", nghttp2_strerror(rv));
-                cleanup_session();
+            client.stream = h2session_request(&client.S,
+                                              hdrs, ARRLEN(hdrs));
+            if(client.stream==NULL) {
+                fprintf(stderr, "Failed to create client stream\n");
+                cleanup_session(h2sess);
             } else {
 
-                nghttp2_nv hdrs[] = {
-                    MAKE_NV(":method", "GET"),
-                    MAKE_NV(":scheme", "http"),
-                    MAKE_NV(":authority", "localhost"),
-                    MAKE_NV(":path", "/")};
-
-                client.streamid = nghttp2_submit_request(client.h2sess, NULL,
-                                                         hdrs, ARRLEN(hdrs),
-                                                         NULL, NULL);
-                if(client.streamid<0) {
-                    fprintf(stderr, "Failed to create client stream\n");
-                    cleanup_session();
-                } else {
-
-                    if(nghttp2_session_send(client.h2sess)) {
-                        fprintf(stderr, "Failed to flush client stream\n");
-                        cleanup_session();
-                    } else
-                        printf("Sent request\n");
-                }
+                if(nghttp2_session_send(client.S.h2sess)) {
+                    fprintf(stderr, "Failed to flush client stream\n");
+                    cleanup_session(h2sess);
+                } else
+                    printf("Sent request\n");
             }
-
         }
 
-        nghttp2_session_callbacks_del(callbacks);
-        nghttp2_option_del(option);
-
-    } else {
-        if(what&BEV_EVENT_ERROR) {
-            printf("Client error\n");
-        }
-        if(what&BEV_EVENT_TIMEOUT) {
-            printf("Client timeout\n");
-        }
-        printf("Client close\n");
-        cleanup_session();
     }
+
+    nghttp2_session_callbacks_del(callbacks);
+    nghttp2_option_del(option);
+    return 0;
+}
+
+static
+int stream_have_header(h2stream *strm, const nghttp2_nv *hdr)
+{
+    printf("Header: %s: %s\n", hdr->name, hdr->value);
+    return 0;
+}
+
+static
+int stream_have_eoh(h2stream *strm)
+{
+    printf("Response headers ends\n");
+    return 0;
+}
+
+static
+int stream_have_eoi(h2stream *strm)
+{
+    printf("Response data ends\n");
+    return 0;
+}
+
+static
+void stream_close(h2stream *strm)
+{
+    memset(strm, 0, sizeof(*strm));
+    free(strm);
+    printf("Stream ends\n");
+    nghttp2_session_terminate_session(client.S.h2sess, NGHTTP2_NO_ERROR);
+    event_base_loopexit(client.base, NULL);
+}
+
+static
+ssize_t stream_read(h2stream* S, const char *buf, size_t blen)
+{
+    return blen;
+}
+
+static
+ssize_t stream_write(h2stream* S, char *buf, size_t blen)
+{
+    return 0;
+}
+
+static
+h2stream* buildstream(h2session* sess)
+{
+    h2stream *strm = calloc(1, sizeof(*strm));
+    if(strm) {
+        strm->have_header = &stream_have_header;
+        strm->have_eoh = &stream_have_eoh;
+        strm->have_eoi = &stream_have_eoi;
+        strm->close = &stream_close;
+        strm->read = &stream_read;
+        strm->write = &stream_write;
+    }
+    return strm;
 }
 
 int main(int argc, char *argv[])
@@ -232,12 +180,16 @@ int main(int argc, char *argv[])
     client.dns = evdns_base_new(client.base, 1);
     assert(client.dns);
 
-    client.bev = bufferevent_socket_new(client.base, -1, BEV_OPT_CLOSE_ON_FREE);
-    assert(client.bev);
+    client.S.cleanup = &cleanup_session;
+    client.S.connect = &sockconnect;
+    client.S.build_stream = &buildstream;
 
-    bufferevent_setcb(client.bev, sockread, NULL, sockevent, NULL);
+    client.S.bev = bufferevent_socket_new(client.base, -1, BEV_OPT_CLOSE_ON_FREE);
+    assert(client.S.bev);
 
-    if(bufferevent_socket_connect_hostname(client.bev, client.dns,
+    h2session_setup_bev(&client.S);
+
+    if(bufferevent_socket_connect_hostname(client.S.bev, client.dns,
                                            AF_UNSPEC, argv[1], atoi(argv[2])))
     {
         fprintf(stderr, "Failed to start connecting!\n");
@@ -247,7 +199,7 @@ int main(int argc, char *argv[])
         client.running = 0;
     }
 
-    cleanup_session();
+    cleanup_session(&client.S);
 
     evdns_base_free(client.dns, 1);
     event_base_free(client.base);

@@ -20,6 +20,10 @@ include_directories(
   ${NGHTTP2_INCLUDE_DIRS}
 )
 
+add_library(h2com STATIC
+  h2transport.c h2transport.h
+)
+
 add_executable(server404
   serve404.c
   util.c util.h
@@ -27,6 +31,7 @@ add_executable(server404
 target_link_libraries(server404
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
+  h2com
 )
 
 add_executable(client
@@ -36,4 +41,5 @@ add_executable(client
 target_link_libraries(client
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
+  h2com
 )

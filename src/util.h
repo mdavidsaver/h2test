@@ -3,6 +3,18 @@
 
 #include <stdio.h>
 
+#ifndef CONTAINER
+# ifdef __GNUC__
+#   define CONTAINER(ptr, structure, member) ({                     \
+        const __typeof(((structure*)0)->member) *_ptr = (ptr);      \
+        (structure*)((char*)_ptr - offsetof(structure, member));    \
+    })
+# else
+#   define CONTAINER(ptr, structure, member) \
+        ((structure*)((char*)(ptr) - offsetof(structure, member)))
+# endif
+#endif
+
 #define ARRLEN(x) (sizeof(x) / sizeof(x[0]))
 
 #define MAKE_NV(NAME, VALUE)                                                   \

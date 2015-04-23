@@ -27,6 +27,7 @@
 #include <nghttp2/nghttp2.h>
 
 #include "util.h"
+#include "h2transport.h"
 
 #define TXBUF (16*1024)
 
@@ -38,12 +39,10 @@ typedef struct {
 typedef struct request request;
 
 typedef struct {
-    server *serv;
-    struct bufferevent *bev;
-    struct event *pingtimer;
-    nghttp2_session *h2sess;
+    h2session S; /* must be first */
 
-    unsigned int sendwait:1;
+    server *serv;
+    struct event *pingtimer;
 
     request *first;
 } session;
@@ -55,149 +54,61 @@ struct request {
     int32_t streamid;
 };
 
-/* on_begin_headers_callback, start of a new stream (request) */
 static
-int request_begin(nghttp2_session *h2sess,
-                  const nghttp2_frame *frame,
-                  void *raw)
+int stream_have_header(h2stream *strm, const nghttp2_nv *hdr)
 {
-    session *sess = raw;
-    request *req = calloc(1, sizeof(*req));
-    assert(sess->h2sess==h2sess);
-
-    if(!req) {
-        fprintf(stderr, "Failed to alloc request\n");
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-
-    req->sess = sess;
-    req->streamid = frame->hd.stream_id;
-    printf("Open stream %d\n", (int)req->streamid);
-
-    if(nghttp2_session_set_stream_user_data(h2sess, req->streamid, req)) {
-        fprintf(stderr, "Failed to add request\n");
-        free(req);
-        return nghttp2_submit_rst_stream(h2sess, NGHTTP2_FLAG_NONE,
-                                         frame->hd.stream_id, NGHTTP2_ERR_INVALID_ARGUMENT);
-    }
-
-    req->next = sess->first;
-    sess->first = req;
+    printf("Header: %s: %s\n", hdr->name, hdr->value);
     return 0;
 }
 
 static
-int request_end(nghttp2_session *h2sess, int32_t streamid,
-                uint32_t error_code, void *raw)
+int stream_have_eoh(h2stream *strm)
 {
-    session *sess = raw;
-    request *req = nghttp2_session_get_stream_user_data(h2sess, streamid);
+    nghttp2_nv hdr404[] = {MAKE_NV(":status", "404")};
+    printf("Send response\n");
+    return h2session_respond(strm, hdr404, ARRLEN(hdr404));
+}
 
-    if(!req) {
-        printf("Close unknown stream\n");
-        return 0;
-    }
-
-    printf("Close stream %d = %u\n", (int)req->streamid, error_code);
-
-    /* remove from list */
-    assert(sess->first);
-    if(sess->first==req) {
-        sess->first = req->next;
-
-    } else {
-        request *prev = sess->first;
-        while(1) {
-            assert(prev); /* req must be in the list */
-            if(prev->next!=req)
-                continue;
-            prev->next = req->next;
-            break;
-        }
-    }
-    free(req);
-
+static
+int stream_have_eoi(h2stream *strm)
+{
+    printf("Request data ends\n");
     return 0;
 }
 
 static
-int on_frame_recv_callback(nghttp2_session *h2sess,
-                                  const nghttp2_frame *frame, void *raw)
+void stream_close(h2stream *strm)
 {
-    session *sess = raw;
-    assert(sess->h2sess==h2sess);
-    switch(frame->hd.type) {
-    case NGHTTP2_HEADERS:
-        if(frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)
-        {
-            /* end of headers */
-            int ret;
-            request *req = nghttp2_session_get_stream_user_data(h2sess, frame->hd.stream_id);
-            nghttp2_nv hdr404[] = {MAKE_NV(":status", "404")};
+    memset(strm, 0, sizeof(*strm));
+    free(strm);
+    printf("Stream ends\n");
+}
 
-            if(req) {
+static
+ssize_t stream_read(h2stream* S, const char *buf, size_t blen)
+{
+    return blen;
+}
 
-                assert(req->streamid==frame->hd.stream_id);
-
-                /* process request */
-                ret = nghttp2_submit_response(h2sess, req->streamid, hdr404, ARRLEN(hdr404), NULL);
-                if(ret) {
-                    fprintf(stderr, "Failed to submit response: %d\n", ret);
-                    return nghttp2_submit_rst_stream(h2sess, NGHTTP2_FLAG_NONE,
-                                                     frame->hd.stream_id, ret);
-                }
-            }
-
-        }
-        break;
-    case NGHTTP2_PING:
-        if(frame->hd.flags & NGHTTP2_FLAG_ACK)
-        {
-            /* PING ack. */
-            printf("pong\n");
-        }
-        break;
-    case NGHTTP2_GOAWAY:
-        break;
-    default:
-        break;
-    }
-
+static
+ssize_t stream_write(h2stream* S, char *buf, size_t blen)
+{
     return 0;
 }
 
-/* move data from nghttp2's send queue into bufferevent's TX queue */
 static
-ssize_t send_sess_data(nghttp2_session *h2sess,
-                       const uint8_t *data, size_t length,
-                       int flags, void *raw)
+h2stream* buildstream(h2session* sess)
 {
-    session *sess = raw;
-    struct evbuffer *buf = bufferevent_get_output(sess->bev);
-
-    assert(sess->h2sess==h2sess);
-
-    if(sess->sendwait)
-        return NGHTTP2_ERR_WOULDBLOCK;
-
-    if(evbuffer_add(buf, data, length)) {
-        fprintf(stderr, "send_sess_data error\n");
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    h2stream *strm = calloc(1, sizeof(*strm));
+    if(strm) {
+        strm->have_header = &stream_have_header;
+        strm->have_eoh = &stream_have_eoh;
+        strm->have_eoi = &stream_have_eoi;
+        strm->close = &stream_close;
+        strm->read = &stream_read;
+        strm->write = &stream_write;
     }
-
-    if(evbuffer_get_length(buf)>=TXBUF) {
-        /* TX buffer is (more than) full, so enable write callback
-         * when buffer length is < TXBUF (aka. EV_WRITE low water-mark)
-         */
-        printf("Throttle\n");
-        sess->sendwait = 1;
-        bufferevent_enable(sess->bev, EV_WRITE);
-    }
-
-    printf("Tx %lu '", (unsigned long)length);
-    fprintf_bytes(stdout, data, length);
-    printf("'\n");
-    return length;
+    return strm;
 }
 
 static
@@ -210,15 +121,9 @@ int prepare_h2_session(session *sess)
     if(nghttp2_option_new(&option)==0 &&
        nghttp2_session_callbacks_new(&callbacks)==0)
     {
-        nghttp2_option_set_recv_client_preface(option, 1);
+        h2session_setup_h2(&sess->S, callbacks, option);
 
-        nghttp2_session_callbacks_set_send_callback(callbacks, send_sess_data);
-
-        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
-        nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, request_begin);
-        nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, request_end);
-
-        if(nghttp2_session_server_new2(&sess->h2sess, callbacks, sess, option)) {
+        if(nghttp2_session_server_new2(&sess->S.h2sess, callbacks, sess, option)) {
             fprintf(stderr, "Failed to create server session\n");
             ret = 1;
 
@@ -235,86 +140,14 @@ int prepare_h2_session(session *sess)
 }
 
 static
-void cleanup_session(session *sess)
+void cleanup_session(h2session *h2sess)
 {
-    nghttp2_session_del(sess->h2sess);
+    session *sess = CONTAINER(h2sess, session, S);
+    nghttp2_session_del(sess->S.h2sess);
     event_free(sess->pingtimer);
-    bufferevent_free(sess->bev);
+    bufferevent_free(sess->S.bev);
     assert(sess->first==NULL);
     free(sess);
-}
-
-/* Move data from bufferevent's RX queue to the NGHTTP2 sesssions input queue */
-static
-void sockread(struct bufferevent *bev, void *raw)
-{
-    session *sess = raw;
-    struct evbuffer *buf = bufferevent_get_input(bev);
-    size_t blen = evbuffer_get_length(buf);
-    unsigned char *cbuf = evbuffer_pullup(buf, -1);
-    ssize_t ret;
-
-    if(!cbuf) {
-        fprintf(stderr, "buf too long! %lu\n", (unsigned long)blen);
-        return;
-    }
-
-    ret = nghttp2_session_mem_recv(sess->h2sess, cbuf, blen);
-    printf("Rx %lu '", (unsigned long)blen);
-    fprintf_bytes(stdout, cbuf, blen);
-    printf("'\n");
-    evbuffer_drain(buf, blen);
-
-    if(ret<0) {
-        fprintf(stderr, "recv error %s\n", nghttp2_strerror(ret));
-        cleanup_session(sess);
-        return;
-
-    } else if(!sess->sendwait) {
-        if(nghttp2_session_send(sess->h2sess)) {
-            fprintf(stderr, "send after recv error\n");
-            cleanup_session(sess);
-        }
-    }
-}
-
-static
-void sockwrite(struct bufferevent *bev, void *raw)
-{
-    int ret;
-    session *sess = raw;
-    if(!sess->sendwait) return;
-    sess->sendwait = 0;
-
-    ret = nghttp2_session_send(sess->h2sess);
-    if(ret) {
-        fprintf(stderr, "send error:%s \n", nghttp2_strerror(ret));
-        cleanup_session(sess);
-
-    } else if(sess->sendwait==0) {
-        /* didn't fill the TX buffer, so disable write callback */
-        bufferevent_disable(sess->bev, EV_WRITE);
-        printf("Un-Throttle\n");
-    }
-}
-
-static
-void sockevent(struct bufferevent *bev, short what, void *raw)
-{
-    session *sess = raw;
-    if(what&BEV_EVENT_CONNECTED) {
-        printf("?????????????? already connected ????????\n");
-
-    } else {
-        if(what&BEV_EVENT_ERROR) {
-            printf("Client error\n");
-        }
-        if(what&BEV_EVENT_TIMEOUT) {
-            printf("Client timeout\n");
-        }
-        printf("Client close\n");
-        cleanup_session(sess);
-    }
 }
 
 static
@@ -322,11 +155,11 @@ void pingconn(evutil_socket_t s, short evt, void *raw)
 {
     session *sess = raw;
 
-    if(nghttp2_submit_ping(sess->h2sess, NGHTTP2_FLAG_NONE, NULL) ||
-            nghttp2_session_send(sess->h2sess))
+    if(nghttp2_submit_ping(sess->S.h2sess, NGHTTP2_FLAG_NONE, NULL) ||
+            nghttp2_session_send(sess->S.h2sess))
     {
         fprintf(stderr, "Ping failed\n");
-        cleanup_session(sess);
+        cleanup_session(&sess->S);
     }
 }
 
@@ -339,21 +172,18 @@ void newconn(struct evconnlistener *lev, evutil_socket_t sock, struct sockaddr *
     sess = calloc(1, sizeof(*sess));
     if(sess) {
         sess->serv = serv;
+        sess->S.build_stream = buildstream;
+        sess->S.cleanup = &cleanup_session;
         /* periodic timer */
         sess->pingtimer = event_new(serv->base, -1, EV_PERSIST, pingconn, sess);
         assert(sess->pingtimer);
-        sess->bev = bufferevent_socket_new(serv->base, sock, BEV_OPT_CLOSE_ON_FREE);
-        if(sess->bev) {
-            const struct timeval txtmo = {10,0}, rxtmo = {10,0};
-
-            bufferevent_setcb(sess->bev, sockread, sockwrite, sockevent, sess);
-            bufferevent_setwatermark(sess->bev, EV_READ, 0, 1024);
-            bufferevent_setwatermark(sess->bev, EV_WRITE, TXBUF, 0);
-            bufferevent_set_timeouts(sess->bev, &rxtmo, &txtmo);
-            bufferevent_enable(sess->bev, EV_READ);
+        sess->S.bev = bufferevent_socket_new(serv->base, sock, BEV_OPT_CLOSE_ON_FREE);
+        if(sess->S.bev) {
+            h2session_setup_bev(&sess->S);
+            bufferevent_enable(sess->S.bev, EV_READ);
 
             if(prepare_h2_session(sess)) {
-                bufferevent_free(sess->bev);
+                bufferevent_free(sess->S.bev);
                 free(sess);
                 printf("Client failed\n");
                 return;
@@ -368,11 +198,11 @@ void newconn(struct evconnlistener *lev, evutil_socket_t sock, struct sockaddr *
 //                bufferevent_write(sess->bev, NGHTTP2_CLIENT_CONNECTION_PREFACE,
 //                                NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
 
-                if ((rv=nghttp2_submit_settings(sess->h2sess, NGHTTP2_FLAG_NONE, iv, ARRLEN(iv))) ||
-                        (rv=nghttp2_session_send(sess->h2sess)))
+                if ((rv=nghttp2_submit_settings(sess->S.h2sess, NGHTTP2_FLAG_NONE, iv, ARRLEN(iv))) ||
+                        (rv=nghttp2_session_send(sess->S.h2sess)))
                 {
                     printf("submit error: %s", nghttp2_strerror(rv));
-                    cleanup_session(sess);
+                    cleanup_session(&sess->S);
                 } else {
                     const struct timeval itvl = {5,0};
                     printf("Connection ready\n");
@@ -381,7 +211,7 @@ void newconn(struct evconnlistener *lev, evutil_socket_t sock, struct sockaddr *
             }
         }
     }
-    if(!sess || !sess->bev) {
+    if(!sess || !sess->S.bev) {
         fprintf(stderr, "No memory\n");
         free(sess);
         close(sock);
