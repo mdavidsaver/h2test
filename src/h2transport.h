@@ -21,7 +21,7 @@ struct h2session {
     int (*connect)(h2session*);
     h2stream* (*build_stream)(h2session*);
 
-    struct h2stream *strm_first;
+    h2stream *strm_first;
 };
 
 struct h2stream {

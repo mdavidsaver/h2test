@@ -15,6 +15,17 @@
 static
 void cleanup_session(h2session *sess)
 {
+    h2stream *strm = sess->strm_first, *nextstrm = NULL;
+    while(strm)
+    {
+        if(strm->strm_next)
+            nextstrm = strm->strm_next;
+
+        (*strm->close)(strm);
+
+        strm = nextstrm;
+        nextstrm = NULL;
+    }
     if(sess->cleanup)
         (*sess->cleanup)(sess);
 }
