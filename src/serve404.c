@@ -62,7 +62,8 @@ static
 int stream_have_eoh(h2stream *strm)
 {
     request *req = CONTAINER(strm, request, R);
-    nghttp2_nv hdr404[] = {MAKE_NV(":status", "404")};
+    nghttp2_nv hdr404[] = {MAKE_NV(":status", "404"),
+                           MAKE_NV("content-encoding", "text/plain")};
     req->buf = req->alloc = malloc(ARRLEN(msg404));
     memcpy((char*)req->buf, msg404, ARRLEN(msg404));
     printf("Send response\n");
@@ -204,9 +205,6 @@ void newconn(struct evconnlistener *lev, evutil_socket_t sock, struct sockaddr *
                     {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
                 };
                 int rv;
-
-//                bufferevent_write(sess->bev, NGHTTP2_CLIENT_CONNECTION_PREFACE,
-//                                NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
 
                 if ((rv=nghttp2_submit_settings(sess->S.h2sess, NGHTTP2_FLAG_NONE, iv, ARRLEN(iv))) ||
                         (rv=nghttp2_session_send(sess->S.h2sess)))

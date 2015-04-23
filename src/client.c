@@ -90,11 +90,12 @@ int sockconnect(h2session *h2sess)
             cleanup_session(h2sess);
         } else {
 
-            nghttp2_nv hdrs[4] = {
+            nghttp2_nv hdrs[5] = {
                 MAKE_NV(":method", "GET"),
                 MAKE_NV(":scheme", "http"),
                 MAKE_NV(":authority", "localhost"),
-                MAKE_NV(":path", "/")};
+                MAKE_NV(":path", "/"),
+                MAKE_NV("content-encoding", "text/plain")};
             hdrs[3].value = (uint8_t*)client.path;
             hdrs[3].valuelen = strlen(client.path);
 
