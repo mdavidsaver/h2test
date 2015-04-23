@@ -36,23 +36,18 @@ typedef struct {
     struct evconnlistener *listener;
 } server;
 
-typedef struct request request;
-
 typedef struct {
     h2session S; /* must be first */
 
     server *serv;
     struct event *pingtimer;
-
-    request *first;
 } session;
 
-struct request {
-    session *sess;
-    request *next;
+typedef struct {
+    h2stream R;
 
-    int32_t streamid;
-};
+    const char *buf, *alloc;
+} request;
 
 static
 int stream_have_header(h2stream *strm, const nghttp2_nv *hdr)
@@ -61,10 +56,15 @@ int stream_have_header(h2stream *strm, const nghttp2_nv *hdr)
     return 0;
 }
 
+static const char msg404[] = "No one is home\n";
+
 static
 int stream_have_eoh(h2stream *strm)
 {
+    request *req = CONTAINER(strm, request, R);
     nghttp2_nv hdr404[] = {MAKE_NV(":status", "404")};
+    req->buf = req->alloc = malloc(ARRLEN(msg404));
+    memcpy((char*)req->buf, msg404, ARRLEN(msg404));
     printf("Send response\n");
     return h2session_respond(strm, hdr404, ARRLEN(hdr404));
 }
@@ -79,36 +79,47 @@ int stream_have_eoi(h2stream *strm)
 static
 void stream_close(h2stream *strm)
 {
-    memset(strm, 0, sizeof(*strm));
-    free(strm);
+    request *req = CONTAINER(strm, request, R);
+    free((char*)req->alloc);
+    memset(req, 0, sizeof(*req));
+    free(req);
     printf("Stream ends\n");
 }
 
 static
-ssize_t stream_read(h2stream* S, const char *buf, size_t blen)
+int stream_read(h2stream* S, const char *buf, size_t blen)
 {
-    return blen;
+    printf("Server received %lu '", (unsigned long)blen);
+    fprintf_bytes(stdout, buf, blen);
+    printf("'\n");
+    return 0;
 }
 
 static
 ssize_t stream_write(h2stream* S, char *buf, size_t blen)
 {
-    return 0;
+    request *req = CONTAINER(S, request, R);
+    size_t L = strlen(req->buf);
+    if(L>blen)
+        L = blen;
+    memcpy(buf, req->buf, L);
+    req->buf += L;
+    printf("Server sent %lu bytes\n", (unsigned long)L);
+    return L;
 }
 
 static
 h2stream* buildstream(h2session* sess)
 {
-    h2stream *strm = calloc(1, sizeof(*strm));
-    if(strm) {
-        strm->have_header = &stream_have_header;
-        strm->have_eoh = &stream_have_eoh;
-        strm->have_eoi = &stream_have_eoi;
-        strm->close = &stream_close;
-        strm->read = &stream_read;
-        strm->write = &stream_write;
-    }
-    return strm;
+    request *strm = calloc(1, sizeof(*strm));
+    if(!strm) return NULL;
+    strm->R.have_header = &stream_have_header;
+    strm->R.have_eoh = &stream_have_eoh;
+    strm->R.have_eoi = &stream_have_eoi;
+    strm->R.close = &stream_close;
+    strm->R.read = &stream_read;
+    strm->R.write = &stream_write;
+    return &strm->R;
 }
 
 static
@@ -146,7 +157,6 @@ void cleanup_session(h2session *h2sess)
     nghttp2_session_del(sess->S.h2sess);
     event_free(sess->pingtimer);
     bufferevent_free(sess->S.bev);
-    assert(sess->first==NULL);
     free(sess);
 }
 

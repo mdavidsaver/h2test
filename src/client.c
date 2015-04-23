@@ -33,7 +33,14 @@ static struct {
     struct evdns_base *dns;
     h2stream *stream;
     char *path;
+    char *data;
 } client;
+
+typedef struct {
+    h2stream R;
+
+    const char *buf;
+} request;
 
 static
 void cleanup_session(h2session *h2sess)
@@ -83,11 +90,13 @@ int sockconnect(h2session *h2sess)
             cleanup_session(h2sess);
         } else {
 
-            nghttp2_nv hdrs[] = {
+            nghttp2_nv hdrs[4] = {
                 MAKE_NV(":method", "GET"),
                 MAKE_NV(":scheme", "http"),
                 MAKE_NV(":authority", "localhost"),
                 MAKE_NV(":path", "/")};
+            hdrs[3].value = (uint8_t*)client.path;
+            hdrs[3].valuelen = strlen(client.path);
 
             client.stream = h2session_request(&client.S,
                                               hdrs, ARRLEN(hdrs));
@@ -143,30 +152,44 @@ void stream_close(h2stream *strm)
 }
 
 static
-ssize_t stream_read(h2stream* S, const char *buf, size_t blen)
+int stream_read(h2stream* S, const char *buf, size_t blen)
 {
-    return blen;
+    printf("Client received %lu '", (unsigned long)blen);
+    fprintf_bytes(stdout, buf, blen);
+    printf("'\n");
+    return 0;
 }
 
 static
 ssize_t stream_write(h2stream* S, char *buf, size_t blen)
 {
-    return 0;
+    request *req = CONTAINER(S, request, R);
+    size_t L = 0;
+    if(req->buf)
+    {
+        L = strlen(req->buf);
+        if(L>blen)
+            L = blen;
+        memcpy(buf, req->buf, L);
+        req->buf += L;
+    }
+    printf("Client sent %lu bytes\n", (unsigned long)L);
+    return L;
 }
 
 static
 h2stream* buildstream(h2session* sess)
 {
-    h2stream *strm = calloc(1, sizeof(*strm));
-    if(strm) {
-        strm->have_header = &stream_have_header;
-        strm->have_eoh = &stream_have_eoh;
-        strm->have_eoi = &stream_have_eoi;
-        strm->close = &stream_close;
-        strm->read = &stream_read;
-        strm->write = &stream_write;
-    }
-    return strm;
+    request *strm = calloc(1, sizeof(*strm));
+    if(!strm) return NULL;
+    strm->R.have_header = &stream_have_header;
+    strm->R.have_eoh = &stream_have_eoh;
+    strm->R.have_eoi = &stream_have_eoi;
+    strm->R.close = &stream_close;
+    strm->R.read = &stream_read;
+    strm->R.write = &stream_write;
+    strm->buf = client.data;
+    return &strm->R;
 }
 
 int main(int argc, char *argv[])
@@ -183,6 +206,10 @@ int main(int argc, char *argv[])
     client.S.cleanup = &cleanup_session;
     client.S.connect = &sockconnect;
     client.S.build_stream = &buildstream;
+    client.path = strdup(argv[3]);
+
+    if(argc>=5)
+        client.data = strdup(argv[4]);
 
     client.S.bev = bufferevent_socket_new(client.base, -1, BEV_OPT_CLOSE_ON_FREE);
     assert(client.S.bev);
@@ -203,6 +230,9 @@ int main(int argc, char *argv[])
 
     evdns_base_free(client.dns, 1);
     event_base_free(client.base);
+
+    free(client.path);
+    free(client.data);
 
     memset(&client, 0, sizeof(client));
 

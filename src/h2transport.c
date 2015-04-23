@@ -173,6 +173,7 @@ int on_frame_recv_callback(nghttp2_session *h2sess,
         }
         fprintf(stderr, "Go away: last=%d error=%d: %s\n", frame->goaway.last_stream_id,
                 frame->goaway.error_code, buf);
+        free(buf);
     }
         break;
     default:
@@ -223,8 +224,11 @@ int stream_read(nghttp2_session *session,
                 const uint8_t *data,
                 size_t len, void *user_data)
 {
-    h2stream *strm = user_data;
+    h2session *sess = user_data;
+    h2stream *strm = nghttp2_session_get_stream_user_data(session, stream_id);
+    if(!strm) return 0;
 
+    assert(strm->sess==sess);
     assert(strm->sess->h2sess==session);
     assert(strm->streamid==stream_id);
 
@@ -252,13 +256,12 @@ void sockread(struct bufferevent *bev, void *raw)
         return;
     }
 
-    ret = nghttp2_session_mem_recv(sess->h2sess, cbuf, blen);
-    printf("Rx %lu '", (unsigned long)blen);
+    printf("Rx buf %lu '", (unsigned long)blen);
     fprintf_bytes(stdout, cbuf, blen);
     printf("'\n");
-    evbuffer_drain(buf, blen);
+    ret = nghttp2_session_mem_recv(sess->h2sess, cbuf, blen);
 
-    if(ret<0) {
+    if(ret<=0) {
         fprintf(stderr, "recv error %s\n", nghttp2_strerror(ret));
         cleanup_session(sess);
         return;
@@ -269,6 +272,8 @@ void sockread(struct bufferevent *bev, void *raw)
             cleanup_session(sess);
         }
     }
+    printf("Rx consume %ld \n", (long)ret);
+    evbuffer_drain(buf, ret);
 }
 
 static
@@ -344,9 +349,10 @@ ssize_t stream_write(
         uint32_t *data_flags, nghttp2_data_source *source, void *user_data)
 {
     ssize_t ret;
-    /*h2session *sess = user_data;*/
+    h2session *sess = user_data;
     h2stream *strm = source->ptr;
 
+    assert(strm->sess==sess);
     assert(strm->sess->h2sess==session);
     assert(strm->streamid==stream_id);
 
@@ -372,7 +378,7 @@ ssize_t stream_write(
 h2stream* h2session_request(h2session *sess, nghttp2_nv *hdrs, size_t nhdrs)
 {
     h2stream *strm;
-    nghttp2_data_provider prov;
+    nghttp2_data_provider prov, *pprov = &prov;
     int32_t streamid;
 
     strm = (*sess->build_stream)(sess);
@@ -380,8 +386,10 @@ h2stream* h2session_request(h2session *sess, nghttp2_nv *hdrs, size_t nhdrs)
 
     prov.read_callback = &stream_write;
     prov.source.ptr = strm;
+    if(!strm->write)
+        pprov = NULL;
 
-    streamid = nghttp2_submit_request(sess->h2sess, NULL, hdrs, nhdrs, &prov, strm);
+    streamid = nghttp2_submit_request(sess->h2sess, NULL, hdrs, nhdrs, pprov, strm);
     if(streamid<=0) {
         fprintf(stderr, "Failed to submit request %d\n", streamid);
         nghttp2_session_set_stream_user_data(strm->sess->h2sess, strm->streamid, NULL);
@@ -401,13 +409,15 @@ h2stream* h2session_request(h2session *sess, nghttp2_nv *hdrs, size_t nhdrs)
 
 int h2session_respond(h2stream *strm, nghttp2_nv *hdrs, size_t nhdrs)
 {
-    nghttp2_data_provider prov;
+    nghttp2_data_provider prov, *pprov = &prov;
     int32_t err;
 
     prov.read_callback = &stream_write;
     prov.source.ptr = strm;
+    if(!strm->write)
+        pprov = NULL;
 
-    err = nghttp2_submit_response(strm->sess->h2sess, strm->streamid, hdrs, nhdrs, &prov);
+    err = nghttp2_submit_response(strm->sess->h2sess, strm->streamid, hdrs, nhdrs, pprov);
     if(err) {
         fprintf(stderr, "Failed to submit response %d\n", err);
         nghttp2_session_set_stream_user_data(strm->sess->h2sess, strm->streamid, NULL);
