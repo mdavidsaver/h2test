@@ -21,9 +21,15 @@ include_directories(
   ${EVENT2_INCLUDE_DIRS}
 )
 
+add_library(h2common
+  h2internal.h h2op.h
+  transport.cpp
+  server.cpp
+)
+
 # DEMO
 
-add_library(h2com STATIC
+add_library(h2demo STATIC
   demo/h2transport.c demo/h2transport.h
 )
 
@@ -34,7 +40,7 @@ add_executable(server404
 target_link_libraries(server404
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
-  h2com
+  h2demo
 )
 
 add_executable(servertick
@@ -44,7 +50,7 @@ add_executable(servertick
 target_link_libraries(servertick
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
-  h2com
+  h2demo
 )
 
 add_executable(serverspam
@@ -54,7 +60,7 @@ add_executable(serverspam
 target_link_libraries(serverspam
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
-  h2com
+  h2demo
 )
 
 add_executable(client
@@ -64,5 +70,5 @@ add_executable(client
 target_link_libraries(client
   ${NGHTTP2_LIBRARIES}
   ${EVENT2_LIBRARIES}
-  h2com
+  h2demo
 )
