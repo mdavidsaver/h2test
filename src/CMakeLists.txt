@@ -18,6 +18,7 @@ find_package(EVENT2 REQUIRED COMPONENTS core extra)
 
 include_directories(
   ${NGHTTP2_INCLUDE_DIRS}
+  ${EVENT2_INCLUDE_DIRS}
 )
 
 add_library(h2com STATIC
