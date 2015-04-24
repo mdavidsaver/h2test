@@ -1,4 +1,8 @@
-
+/** @file client.c
+ *
+ * NGHTTP2 based client which requests one stream and consume it
+ * at a rate of 100 bytes per second.
+ */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +43,7 @@ static struct {
 typedef struct {
     h2stream R;
 
+    struct event* acktimer;
     const char *buf;
 } request;
 
@@ -67,6 +72,7 @@ int sockconnect(h2session *h2sess)
     nghttp2_session_callbacks_new(&callbacks);
 
     h2session_setup_h2(&client.S, callbacks, option);
+    nghttp2_option_set_no_auto_window_update(option, 1);
 
     if(nghttp2_session_client_new2(&client.S.h2sess, callbacks, &client.S, option)) {
         fprintf(stderr, "Failed to create client session\n");
@@ -74,9 +80,12 @@ int sockconnect(h2session *h2sess)
     } else {
         bufferevent_enable(client.S.bev, EV_READ);
 
+        client.S.autoacksess = 1;
+
         nghttp2_settings_entry iv[] = {
             {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
-            {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}
+            {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
+            {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1000}
         };
         int rv;
 
@@ -85,7 +94,7 @@ int sockconnect(h2session *h2sess)
 
         rv = nghttp2_submit_settings(client.S.h2sess, NGHTTP2_FLAG_NONE, iv,
                                      ARRLEN(iv));
-        if (rv != 0) {
+        if (rv != 0 || nghttp2_submit_window_update(client.S.h2sess, 0, 0, -30000)) {
             printf("failed to submit settings: %s", nghttp2_strerror(rv));
             cleanup_session(h2sess);
         } else {
@@ -106,11 +115,19 @@ int sockconnect(h2session *h2sess)
                 cleanup_session(h2sess);
             } else {
 
-                if(nghttp2_session_send(client.S.h2sess)) {
-                    fprintf(stderr, "Failed to flush client stream\n");
+                if(nghttp2_session_send(client.S.h2sess) || /* streamid not valid until sent */
+                        nghttp2_submit_window_update(client.S.h2sess, 0, client.stream->streamid,
+                                                     -900) ||
+                        nghttp2_session_send(client.S.h2sess))
+                {
+                    fprintf(stderr, "Failed to set window size or flush client stream\n");
                     cleanup_session(h2sess);
                 } else
-                    printf("Sent request\n");
+                    printf("Sent request %d rx window=%d/%d\n", client.stream->streamid,
+                           nghttp2_session_get_stream_effective_recv_data_length(client.S.h2sess,
+                                                                                  client.stream->streamid),
+                           nghttp2_session_get_stream_effective_local_window_size(client.S.h2sess,
+                                                                                  client.stream->streamid));
             }
         }
 
@@ -145,6 +162,8 @@ int stream_have_eoi(h2stream *strm)
 static
 void stream_close(h2stream *strm)
 {
+    request *req = CONTAINER(strm, request, R);
+    event_free(req->acktimer);
     memset(strm, 0, sizeof(*strm));
     free(strm);
     printf("Stream ends\n");
@@ -158,6 +177,11 @@ int stream_read(h2stream* S, const char *buf, size_t blen)
     printf("Client received %lu '", (unsigned long)blen);
     fprintf_bytes(stdout, buf, blen);
     printf("'\n");
+    printf("unack'd data size %d/%d\n",
+           nghttp2_session_get_stream_effective_recv_data_length(client.S.h2sess,
+                                                                  client.stream->streamid),
+           nghttp2_session_get_stream_effective_local_window_size(client.S.h2sess,
+                                                                  client.stream->streamid));
     return 0;
 }
 
@@ -179,6 +203,22 @@ ssize_t stream_write(h2stream* S, char *buf, size_t blen)
 }
 
 static
+void stream_ack(evutil_socket_t s, short evt, void *raw)
+{
+    int32_t unack = nghttp2_session_get_stream_effective_recv_data_length(client.S.h2sess,
+                                                                          client.stream->streamid);
+    if(unack==0) return;
+    if(nghttp2_session_consume_stream(client.S.h2sess, client.stream->streamid, unack))
+    {
+        fprintf(stderr, "Client stream ack fails\n");
+    } else if(nghttp2_session_send(client.S.h2sess)) {
+        fprintf(stderr, "Client stream ack send fails\n");
+    } else {
+        printf("Client stream ack'd %d\n", unack);
+    }
+}
+
+static
 h2stream* buildstream(h2session* sess)
 {
     request *strm = calloc(1, sizeof(*strm));
@@ -190,6 +230,11 @@ h2stream* buildstream(h2session* sess)
     strm->R.read = &stream_read;
     strm->R.write = &stream_write;
     strm->buf = client.data;
+    strm->acktimer = event_new(client.base, -1, EV_TIMEOUT|EV_PERSIST, &stream_ack, strm);
+    if(strm->acktimer) {
+        const struct timeval itvl = {1, 0};
+        event_add(strm->acktimer, &itvl);
+    }
     return &strm->R;
 }
 

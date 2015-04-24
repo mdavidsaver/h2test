@@ -16,6 +16,7 @@ struct h2session {
     struct bufferevent *bev;
     nghttp2_session *h2sess;
     unsigned int sendwait:1;
+    unsigned int autoacksess:1;
 
     void (*cleanup)(h2session*);
     int (*connect)(h2session*);

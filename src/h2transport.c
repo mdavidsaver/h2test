@@ -246,8 +246,6 @@ int stream_read(nghttp2_session *session,
     if(!strm->read)
         return len; /* ignore */
 
-    /* TODO: disable auto ack. */
-
     return (*strm->read)(strm, (const char*)data, len);
     /* TODO: reset stream on error */
 }
@@ -283,7 +281,12 @@ void sockread(struct bufferevent *bev, void *raw)
             cleanup_session(sess);
         }
     }
-    printf("Rx consume %ld \n", (long)ret);
+    if(sess->autoacksess && nghttp2_session_consume_connection(sess->h2sess, ret)) {
+        fprintf(stderr, "Error consuming connection data\n");
+    }
+    printf("Rx consume %ld %d/%d\n", (long)ret,
+           nghttp2_session_get_effective_recv_data_length(sess->h2sess),
+           nghttp2_session_get_effective_local_window_size(sess->h2sess));
     evbuffer_drain(buf, ret);
 }
 
