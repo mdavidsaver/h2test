@@ -443,5 +443,6 @@ int h2session_respond(h2stream *strm, nghttp2_nv *hdrs, size_t nhdrs)
 int h2stream_can_write(h2stream* strm)
 {
     if(!strm->sendwait) return 0;
+    strm->sendwait = 0;
     return nghttp2_session_resume_data(strm->sess->h2sess, strm->streamid);
 }

@@ -34,6 +34,16 @@ target_link_libraries(server404
   h2com
 )
 
+add_executable(servertick
+  servetick.c
+  util.c util.h
+)
+target_link_libraries(servertick
+  ${NGHTTP2_LIBRARIES}
+  ${EVENT2_LIBRARIES}
+  h2com
+)
+
 add_executable(client
   client.c
   util.c util.h
