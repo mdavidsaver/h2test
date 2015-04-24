@@ -21,13 +21,15 @@ include_directories(
   ${EVENT2_INCLUDE_DIRS}
 )
 
+# DEMO
+
 add_library(h2com STATIC
-  h2transport.c h2transport.h
+  demo/h2transport.c demo/h2transport.h
 )
 
 add_executable(server404
-  serve404.c
-  util.c util.h
+  demo/serve404.c
+  demo/util.c demo/util.h
 )
 target_link_libraries(server404
   ${NGHTTP2_LIBRARIES}
@@ -36,8 +38,8 @@ target_link_libraries(server404
 )
 
 add_executable(servertick
-  servetick.c
-  util.c util.h
+  demo/servetick.c
+  demo/util.c demo/util.h
 )
 target_link_libraries(servertick
   ${NGHTTP2_LIBRARIES}
@@ -46,8 +48,8 @@ target_link_libraries(servertick
 )
 
 add_executable(serverspam
-  servespam.c
-  util.c util.h
+  demo/servespam.c
+  demo/util.c demo/util.h
 )
 target_link_libraries(serverspam
   ${NGHTTP2_LIBRARIES}
@@ -56,8 +58,8 @@ target_link_libraries(serverspam
 )
 
 add_executable(client
-  client.c
-  util.c util.h
+  demo/client.c
+  demo/util.c demo/util.h
 )
 target_link_libraries(client
   ${NGHTTP2_LIBRARIES}
