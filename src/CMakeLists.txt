@@ -44,6 +44,16 @@ target_link_libraries(servertick
   h2com
 )
 
+add_executable(serverspam
+  servespam.c
+  util.c util.h
+)
+target_link_libraries(serverspam
+  ${NGHTTP2_LIBRARIES}
+  ${EVENT2_LIBRARIES}
+  h2com
+)
+
 add_executable(client
   client.c
   util.c util.h
