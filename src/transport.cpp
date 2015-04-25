@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <assert.h>
 
+#include <vector>
+
 #include "h2internal.h"
 
 #define ARRLEN(x) (sizeof(x) / sizeof(x[0]))
@@ -62,6 +64,7 @@ void bev_read(struct bufferevent *bev, void *raw)
         N = ARRLEN(vect);
 
     try{
+        H2::Transport::InCallback incb(sock);
 
         size_t consumed = 0;
         for(int i=0; i<N; i++) {
@@ -77,6 +80,8 @@ void bev_read(struct bufferevent *bev, void *raw)
         if(consumed==0)
             fprintf(stderr, "%s: Warning, RX consumed zero bytes\n", sock->myname.c_str());
         evbuffer_drain(buf, consumed);
+
+        nghttp2_session_consume_connection(sock->h2sess, consumed);
 
         if(!sock->sendwait && (h2error=nghttp2_session_send(sock->h2sess)))
             throw std::runtime_error("Error during send");
@@ -114,6 +119,10 @@ ssize_t send_sess_data(nghttp2_session *h2sess,
         self->sendwait = 1;
         bufferevent_enable(self->bev, EV_WRITE);
     }
+    printf("%s Tx produce %lu %lu/%lu\n", self->myname.c_str(),
+           (unsigned long)length,
+           (unsigned long)nghttp2_session_get_outbound_queue_size(self->h2sess),
+           (unsigned long)nghttp2_session_get_remote_window_size(self->h2sess));
     return length;
 }
 
@@ -154,21 +163,280 @@ int stream_header(nghttp2_session *session,
     assert(req->sock==sock);
     assert(req->streamid==frame->hd.stream_id);
 
-    std::string hname((const char*)name, namelen);
+    std::string hname((const char*)name, namelen),
+                hval((const char*)value, valuelen);
 
-    H2::RequestInfo::headers_t::iterator it = req->info.headers.find(hname);
+    if(name[0]==':') { // handle pseudo headers
+        if(namelen<2) return 0;
+
+        switch(name[1]) {
+        case 'a':
+            if(hname==":authority")
+                req->info.url.authority.swap(hval);
+            break;
+            /*
+        case 'e':
+            if(hname==":expect" && hval=="100-continue") {
+                //TODO: send 100 continue
+                fprintf(stderr, "Peer requested 100-continue, TODO: send it\n");
+            }
+            break;
+            */
+        case 'm':
+            if(hname==":method")
+                req->info.method.swap(hval);
+            break;
+        case 'p':
+            if(hname==":path")
+                req->info.url.path.swap(hval);
+            break;
+        case 's':
+            if(hname==":scheme")
+                req->info.url.scheme.swap(hval);
+            break;
+        default:
+            req->handle_pseudo_header(hname, hval);
+        }
+
+    } else {
+
+        H2::RequestInfo::header_list_t *hlist;
+
+        H2::RequestInfo::headers_t::iterator it = req->info.headers.find(hname);
+        if(it==req->info.headers.end()) {
+            req->info.headers[hname] = H2::RequestInfo::header_list_t();
+            hlist = &req->info.headers[hname];
+        } else
+            hlist = &it->second;
+
+        hlist->push_back(hval);
+    }
+    return 0;
+}
+
+static const char* frame_names[] = {
+    "DATA",
+    "HEAD",
+    "PRIO",
+    "RST ",
+    "SETT",
+    "PUSH",
+    "PING",
+    "GOWY",
+    "WIND"
+};
+
+static
+void debug_frame(const char *dir, H2::Transport *sock, const nghttp2_frame *frame)
+{
+    const char *name = sock->myname.c_str(),
+               *ftype = "???";
+
+    if(frame->hd.type<ARRLEN(frame_names))
+        ftype = frame_names[frame->hd.type];
+
+    printf("%s: %s %s stream=%lu flags=0x%02x length=%lu ",
+           name, dir, ftype,
+           (unsigned long)frame->hd.stream_id,
+           frame->hd.flags,
+           (unsigned long)frame->hd.length);
+
+    if(frame->hd.type>=ARRLEN(frame_names))
+        printf("ftype=%d ",
+               frame->hd.type);
+
+    switch(frame->hd.type) {
+    case NGHTTP2_RST_STREAM:
+        printf("error=%u\n", frame->rst_stream.error_code);
+        break;
+    case NGHTTP2_GOAWAY:
+        printf("error=%u last=%lu %s\n",
+               frame->goaway.error_code,
+               (unsigned long)frame->goaway.last_stream_id,
+               (char*)frame->goaway.opaque_data);
+        break;
+    default:
+        printf("\n");
+    }
+}
+
+static
+int on_frame_recv_callback(nghttp2_session *h2sess,
+                           const nghttp2_frame *frame, void *raw)
+{
+    H2::Transport *sock = (H2::Transport*)raw;
+    H2::RawRequest *req = NULL;
+    bool reset_stream = false;
+
+    assert(sock->h2sess==h2sess);
+
+    debug_frame("recv", sock, frame);
+
+    switch(frame->hd.type) {
+    case NGHTTP2_HEADERS:
+        if(frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)
+        {
+            if(!req) req = (H2::RawRequest*)nghttp2_session_get_stream_user_data(h2sess, frame->hd.stream_id);
+
+            if(req) {
+                assert(req->streamid==frame->hd.stream_id);
+                try{
+                    req->end_of_headers();
+                }catch(std::exception& e){
+                    fprintf(stderr, "%s: Unhandled exception in RawRequest::end_of_headers: %s",
+                            sock->myname.c_str(), e.what());
+                    reset_stream = true;
+                }
+            }
+
+        }
+        /* no break */
+    case NGHTTP2_DATA:
+
+        if(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+        {
+            if(!req) req = (H2::RawRequest*)nghttp2_session_get_stream_user_data(h2sess, frame->hd.stream_id);
+
+            if(req) {
+                try{
+                    req->end_of_data();
+                }catch(std::exception& e){
+                    fprintf(stderr, "%s: Unhandled exception in RawRequest::end_of_data: %s",
+                            sock->myname.c_str(), e.what());
+                    reset_stream = true;
+                }
+            }
+        }
+        break;
+    case NGHTTP2_RST_STREAM:
+        if(frame->rst_stream.error_code)
+            fprintf(stderr, "Stream %d reset %d\n", frame->hd.stream_id,
+                    frame->rst_stream.error_code);
+        break;
+    case NGHTTP2_GOAWAY:
+    {
+        char *buf = (char*)malloc(frame->goaway.opaque_data_len+1);
+        if(buf) {
+            memcpy(buf, frame->goaway.opaque_data, frame->goaway.opaque_data_len);
+            buf[frame->goaway.opaque_data_len] = '\0';
+        }
+        fprintf(stderr, "%s: Go away: last=%d error=%d: %s\n", sock->myname.c_str(),
+                frame->goaway.last_stream_id,
+                frame->goaway.error_code, buf);
+        free(buf);
+    }
+        break;
+    default:
+        break;
+    }
+
+    if(reset_stream) {
+        return nghttp2_submit_rst_stream(h2sess, NGHTTP2_FLAG_NONE,
+                                         frame->hd.stream_id, NGHTTP2_ERR_INVALID_ARGUMENT);
+    }
+    return 0;
+}
+
+static
+int on_frame_send_callback(nghttp2_session *session,
+                           const nghttp2_frame *frame,
+                           void *raw)
+{
+    H2::Transport *sock = (H2::Transport*)raw;
+
+    assert(sock->h2sess==session);
+
+    debug_frame("send", sock, frame);
+    return 0;
+}
+
+static
+int stream_read(nghttp2_session *session,
+                uint8_t flags,
+                int32_t stream_id,
+                const uint8_t *data,
+                size_t len, void *raw)
+{
+    H2::Transport *sock = (H2::Transport*)raw;
+    H2::RawRequest *req = (H2::RawRequest*)nghttp2_session_get_stream_user_data(session, stream_id);
+    if(!req) return 0;
+
+    assert(sock->h2sess==session);
+    assert(req->sock==sock);
+    assert(req->streamid==stream_id);
+
+    if(req->rxeoi) return 0; // ignore further
+
+    if(bufferevent_write(req->sock_bev, data, len)) {
+        fprintf(stderr, "%s: failed to add stream data\n", sock->myname.c_str());
+        return nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                         stream_id, NGHTTP2_ERR_INVALID_ARGUMENT);
+    }
+    return 0;
+}
+
+static
+int stream_end(nghttp2_session *session, int32_t stream_id,
+               uint32_t error_code, void *raw)
+{
+    H2::Transport *sock = (H2::Transport*)raw;
+    H2::RawRequest *req = (H2::RawRequest*)nghttp2_session_get_stream_user_data(session, stream_id);
+    if(!req) return 0;
+
+    assert(sock->h2sess==session);
+    assert(req->sock==sock);
+    assert(req->streamid==stream_id);
+
+    sock->active_requests.erase(req);
+    try{
+        printf("%s: stream %d ends request %p\n", sock->myname.c_str(), req->streamid, req);
+        delete req;
+    }catch(std::exception& e){
+        fprintf(stderr, "%s: Unhandled exception in ~RawRequest: %s\n",
+                sock->myname.c_str(), e.what());
+    }
+    return 0;
+}
+
+static
+void deferred_send(evutil_socket_t s, short evt, void *raw)
+{
+    H2::Transport *self=(H2::Transport*)raw;
+    if(!self->queuesend) return;
+    self->queuesend = false;
+    int ret = nghttp2_session_send(self->h2sess);
+    if(ret)
+        fprintf(stderr, "%s: Failed deferred send\n", self->myname.c_str());
 }
 
 namespace H2 {
 
-Transport::Transport()
-    :bev(0), h2sess(0), sendwait(false)
-{}
+Transport::Transport(event_base *base)
+    :base(base)
+    ,bev(0)
+    ,h2sess(0)
+    ,deferedsend(event_new(base, -1, EV_TIMEOUT, deferred_send, this))
+    ,sendwait(false)
+    ,incb(false)
+    ,queuesend(false)
+{
+    if(!deferedsend)
+        throw std::bad_alloc();
+}
 
 Transport::~Transport()
 {
     nghttp2_session_del(h2sess);
     if(bev) bufferevent_free(bev);
+    event_free(deferedsend);
+    if(active_requests.size())
+        fprintf(stderr, "%s: cleaning %lu active streams\n", myname.c_str(),
+                (unsigned long)active_requests.size());
+    std::set<RawRequest*>::iterator it, end;
+    for(it=active_requests.begin(), end=active_requests.end(); it!=end; ++it)
+    {
+        delete *it;
+    }
 }
 
 void Transport::setup_bev()
@@ -197,17 +465,158 @@ void Transport::setup_ng2(nghttp2_session_callbacks *callbacks, nghttp2_option *
     nghttp2_option_set_no_auto_window_update(option, 1);
 
     nghttp2_session_callbacks_set_send_callback(callbacks, send_sess_data);
-    nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, stream_begin);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, stream_header);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, stream_end);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
+    nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, on_frame_send_callback);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, stream_read);
+}
+
+void Transport::queue_deferred_send()
+{
+    const timeval now = {0,0};
+    if(incb || queuesend) return;
+    if(!event_add(deferedsend, &now))
+        queuesend = true;
+}
+
+void Transport::send_now()
+{
+    int ret = nghttp2_session_send(h2sess);
+    if(ret)
+        throw std::runtime_error("Transport send fails");
+}
+
+ssize_t Transport::stream_write(nghttp2_session *session, int32_t stream_id,
+                     uint8_t *buf, size_t length,
+                     uint32_t *data_flags,
+                     nghttp2_data_source *source, void *raw)
+{
+    Transport *sock = (Transport*)raw;
+    RawRequest *req = (RawRequest*)source->ptr;
+    if(!req) {
+        *data_flags = NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+
+    assert(sock->h2sess==session);
+    assert(req->sock==sock);
+    assert(req->streamid==stream_id);
+    assert(req==(H2::RawRequest*)nghttp2_session_get_stream_user_data(session, stream_id));
+    printf("%s stream %d %p write ", sock->myname.c_str(), stream_id, req);
+
+    if(!req->user) {
+        *data_flags = NGHTTP2_DATA_FLAG_EOF;
+        printf("EOF orphaned stream\n");
+        return 0;
+    }
+
+    //Stream *strm = req->user;
+
+    evbuffer *ebuf = bufferevent_get_input(req->sock_bev);
+    size_t blen = evbuffer_get_length(ebuf);
+
+    if(req->txeoi) {
+        printf("EOF\n");
+        *data_flags = NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    } else if(req->txpaused || blen==0) {
+        printf("Pause\n");
+        req->txpaused = true;
+        return NGHTTP2_ERR_DEFERRED;
+    }
+    size_t tosend = std::min(length, blen);
+    ssize_t nsent = evbuffer_copyout(ebuf, buf, tosend);
+    if(nsent<0) {
+        printf("Error\n");
+        fprintf(stderr, "%s: failed to send stream data\n", sock->myname.c_str());
+        return nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                         stream_id, NGHTTP2_ERR_INVALID_ARGUMENT);
+    }
+    printf("length=%lu\n",(unsigned long)nsent);
+    evbuffer_drain(ebuf, nsent);
+    return nsent;
+}
+
+bufferevent* Stream::bev()
+{
+    return req->user_bev;
+}
+
+void Stream::set_tx_eoi()
+{
+    req->txeoi = true;
+}
+
+bool Stream::tx_eoi() const
+{
+    return req->txeoi;
+}
+
+void Stream::set_rx_buffer(size_t low, size_t high)
+{
+    //TODO
+}
+
+void Stream::send_headers(unsigned int status, const headers_t& H)
+{
+    assert(req->user==this);
+    if(req->sentheaders)
+        throw std::runtime_error("Headers already sent");
+
+    char stsbuf[12];
+    sprintf(stsbuf, "%d", status&0xffffffff);
+
+    std::vector<nghttp2_nv> nH;
+    nH.reserve(H.size()+1);
+    nH.resize(1);
+    nH[0].name = (uint8_t*)":status";
+    nH[0].namelen = 7;
+    nH[0].value = (uint8_t*)stsbuf;
+    nH[0].valuelen = strlen(stsbuf);
+
+    for(headers_t::const_iterator it = H.begin(), end = H.end();it!=end;++it)
+    {
+        const std::string& N = it->first;
+        const RequestInfo::header_list_t& V = it->second;
+        nH.reserve(nH.size()+V.size());
+
+        for(RequestInfo::header_list_t::const_iterator lit = V.begin(), lend = V.end(); lit!=lend; ++lit)
+        {
+            nH.push_back(nghttp2_nv());
+            nghttp2_nv& O = nH.back();
+            O.name = (uint8_t*)N.c_str();
+            O.namelen = N.size();
+            O.value = (uint8_t*)lit->c_str();
+            O.valuelen = lit->size();
+        }
+
+        //TODO: mark none cachable headers?
+    }
+
+    nghttp2_data_provider prov;
+    prov.source.ptr = req;
+    prov.read_callback = &Transport::stream_write;
+    if(req->txeoi && evbuffer_get_length(bufferevent_get_output(req->sock_bev))==0)
+        prov.read_callback = NULL; // no data to send
+    else
+        bufferevent_enable(req->sock_bev, EV_READ);
+
+    printf("%s: stream send headers %d %p\n", req->sock->myname.c_str(), req->streamid, req);
+    int ret = nghttp2_submit_response(req->sock->h2sess, req->streamid, &nH[0], nH.size(), &prov);
+    req->sentheaders = true;
+    if(ret) {
+        fprintf(stderr, "%s: failed to send stream data: %d\n", req->sock->myname.c_str(), ret);
+        nghttp2_submit_rst_stream(req->sock->h2sess, NGHTTP2_FLAG_NONE,
+                                  req->streamid, ret);
+    } else
+        req->sock->queue_deferred_send();
 }
 
 } // namespace H2
 
 
-std::ostream& operator<<(std::ostream& strm, H2::sockaddr_pun addr)
+std::ostream& operator<<(std::ostream& strm, const H2::sockaddr_pun& addr)
 {
     char buf[30];
     unsigned short port;

@@ -1,8 +1,8 @@
 #ifndef H2INTERNAL_H
 #define H2INTERNAL_H
 
-#include <ostream>
 #include <stdexcept>
+#include <set>
 
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -14,23 +14,36 @@
 
 namespace H2 {
 
-union sockaddr_pun {
-    sockaddr_in in;
-    sockaddr_in6 in6;
-};
-
 struct RawRequest
 {
+    RawRequest(Transport *s, int32_t id);
+    virtual ~RawRequest();
+
     Transport *sock;
     RequestInfo info;
-    Request *user;
+    Stream *user;
     int32_t streamid;
+
+    bufferevent *sock_bev, *user_bev;
+    // tx - user to socket,  write to user_bev, read from sock_bev
+    // rx - socket to user, read from user_bev,  write to sock_bev
+    bool txpaused, txeoi, rxeoi, sentheaders;
+
+    void set_user(Stream *s)
+    {
+        user = s;
+        s->req = this;
+    }
+
+    virtual void handle_pseudo_header(const std::string& name, const std::string& value) {}
+    virtual void end_of_headers()=0;
+    virtual void end_of_data()=0;
 };
 
 struct Transport
 {
-    Transport();
-    ~Transport();
+    Transport(event_base *base);
+    virtual ~Transport();
 
     void setup_bev();
     void start_bev();
@@ -38,39 +51,34 @@ struct Transport
     void setup_ng2(nghttp2_session_callbacks *callbacks,
                    nghttp2_option *option);
 
+    event_base *base;
+    std::set<RawRequest*> active_requests;
+
+    sockaddr_pun peer;
     std::string myname;
     struct bufferevent *bev;
     nghttp2_session *h2sess;
 
+    event *deferedsend;
+
     bool sendwait;
+    bool incb;
+    bool queuesend;
+
+    void queue_deferred_send();
+    void send_now();
+
+    struct InCallback {
+        Transport *T;
+        InCallback(Transport *T) :T(T) {T->incb=true;}
+        ~InCallback() {T->incb = false;}
+    };
 
     virtual void connect() {}
 
-    virtual void destory();
+    virtual void destory()=0; // delete this; happens here
     // nghttp2 callbacks
 
-    // on_begin_headers_callback()
-    static int stream_begin(nghttp2_session *h2sess,
-                            const nghttp2_frame *frame,
-                            void *raw);
-    // nghttp2_session_callbacks_set_on_stream_close_callback()
-    static int stream_end(nghttp2_session *h2sess, int32_t streamid,
-                          uint32_t error_code, void *raw);
-    // nghttp2_session_callbacks_set_on_header_callback()
-    static int stream_header(nghttp2_session *session,
-                             const nghttp2_frame *frame, const uint8_t *name,
-                             size_t namelen, const uint8_t *value,
-                             size_t valuelen, uint8_t flags,
-                             void *user_data);
-    // nghttp2_session_callbacks_set_on_frame_recv_callback()
-    static int on_frame_recv_callback(nghttp2_session *h2sess,
-                                      const nghttp2_frame *frame, void *raw);
-    // nghttp2_session_callbacks_set_on_data_chunk_recv_callback()
-    static int stream_read(nghttp2_session *session,
-                           uint8_t flags,
-                           int32_t stream_id,
-                           const uint8_t *data,
-                           size_t len, void *user_data);
     // nghttp2_data_provider::read_callback
     static ssize_t stream_write(
             nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length,
@@ -80,14 +88,14 @@ struct Transport
 struct ServerTransport : public Transport
 {
     ServerTransport(Server *, event_base *, evutil_socket_t sock, const sockaddr_pun &);
-    ~ServerTransport();
+    virtual ~ServerTransport();
 
     Server *server;
     event *pingtimer;
+
+    virtual void destory();
 };
 
 } // namespace H2
-
-std::ostream& operator<<(std::ostream& strm, H2::sockaddr_pun addr);
 
 #endif // H2INTERNAL_H

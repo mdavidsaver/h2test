@@ -23,8 +23,19 @@ include_directories(
 
 add_library(h2common
   h2internal.h h2op.h
+  signal.cpp
   transport.cpp
+  rawrequest.cpp
   server.cpp
+)
+
+add_executable(testserver
+  testserver.cpp
+)
+target_link_libraries(testserver
+  ${NGHTTP2_LIBRARIES}
+  ${EVENT2_LIBRARIES}
+  h2common
 )
 
 # DEMO
