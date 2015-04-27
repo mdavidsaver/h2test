@@ -1,15 +1,13 @@
 
 find_path(EVENT2_INCLUDE_DIRS event2/event.h
-  HINTS ENV EVENT2_DIR
-  PATHS ${EVENT2_DIR}
+  HINTS ${EVENT2_DIR} ENV EVENT2_DIR
   PATH_SUFFIXES include
 )
 
 set(_event2_comps "")
 foreach(comp IN LISTS EVENT2_FIND_COMPONENTS)
   find_library(EVENT2_${comp}_LIBRARY event_${comp}
-    HINTS ENV EVENT2_DIR
-    PATHS ${EVENT2_DIR}
+    HINTS ${EVENT2_DIR} ENV EVENT2_DIR
     PATH_SUFFIXES lib
   )
   list(APPEND EVENT2_LIBRARIES ${EVENT2_${comp}_LIBRARY})

@@ -12,9 +12,11 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
 
-find_package(NGHTTP2 REQUIRED)
-
 find_package(EVENT2 REQUIRED COMPONENTS core extra)
+message(STATUS "Event2 ${EVENT2_INCLUDE_DIRS} ${EVENT2_LIBRARIES}")
+
+find_package(NGHTTP2 REQUIRED)
+message(STATUS "nghttp2 ${NGHTTP2_INCLUDE_DIRS} ${NGHTTP2_LIBRARIES}")
 
 include_directories(
   ${NGHTTP2_INCLUDE_DIRS}
