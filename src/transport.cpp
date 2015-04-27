@@ -390,9 +390,13 @@ int stream_end(nghttp2_session *session, int32_t stream_id,
     sock->active_requests.erase(req);
     try{
         printf("%s: stream %d ends request %p\n", sock->myname.c_str(), req->streamid, req);
+        if(!req->rxeoi)
+            req->end_of_data();
+        if(req->user)
+            req->user->closed();
         delete req;
     }catch(std::exception& e){
-        fprintf(stderr, "%s: Unhandled exception in ~RawRequest: %s\n",
+        fprintf(stderr, "%s: Unhandled exception during stream cleanup %s\n",
                 sock->myname.c_str(), e.what());
     }
     return 0;

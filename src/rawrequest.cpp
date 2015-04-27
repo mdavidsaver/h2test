@@ -13,9 +13,10 @@ void request_ack(struct evbuffer *buffer, const struct evbuffer_cb_info *info, v
         printf("%s: stream %u %p comsumes %lu bytes\n", self->sock->myname.c_str(),
                self->streamid, self, (unsigned long)info->n_deleted);
         int err = nghttp2_session_consume_stream(self->sock->h2sess, self->streamid, info->n_deleted);
-        if(err)
+        if(err) {
             fprintf(stderr, "%s: Failed to consume stream %d\n", self->sock->myname.c_str(), self->streamid);
-        else
+            self->reset(NGHTTP2_INTERNAL_ERROR);
+        } else
             self->sock->queue_deferred_send();
     }
 }
@@ -103,13 +104,23 @@ RawRequest::~RawRequest()
 void RawRequest::tx_resume()
 {
     if(txpaused) {
-        if(nghttp2_session_resume_data(sock->h2sess, streamid))
-            fprintf(stderr, "%s: error resuming stream\n", sock->myname.c_str());
-        else {
+        int err = nghttp2_session_resume_data(sock->h2sess, streamid);
+        if(err) {
+            fprintf(stderr, "%s: error resuming stream: %s\n", sock->myname.c_str(), nghttp2_strerror(err));
+            reset(NGHTTP2_INTERNAL_ERROR);
+        } else {
+            txpaused = false;
             printf("%s: resume stream %d %p\n", sock->myname.c_str(), streamid, this);
             sock->queue_deferred_send();
         }
     }
+}
+
+void RawRequest::reset(uint32_t error)
+{
+    int ret = nghttp2_submit_rst_stream(sock->h2sess, 0, streamid, error);
+    if(ret)
+        fprintf(stderr, "%s: error resetting stream: %s\n", sock->myname.c_str(), nghttp2_strerror(ret));
 }
 
 } // namespace H2

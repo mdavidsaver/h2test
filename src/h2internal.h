@@ -35,6 +35,7 @@ struct RawRequest
         s->req = this;
     }
     void tx_resume();
+    void reset(uint32_t error_code=NGHTTP2_INTERNAL_ERROR);
 
     virtual void handle_pseudo_header(const std::string& name, const std::string& value) {}
     virtual void end_of_headers()=0;
