@@ -16,6 +16,7 @@ class HelloHandle : public H2::Handler
         {
             evbuffer *buf = bufferevent_get_output(bev());
             evbuffer_add_printf(buf, "Hello world\n");
+            bufferevent_flush(bev(), EV_WRITE, BEV_FINISHED);
             H2::Stream::headers_t H;
             H["Content-Type"] = H2::Stream::headers_t::mapped_type();
             H["Content-Type"].push_back("text/ascii");

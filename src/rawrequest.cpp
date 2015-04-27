@@ -1,5 +1,7 @@
 
 #include <assert.h>
+#include <errno.h>
+#include <string.h>
 
 #include "h2internal.h"
 
@@ -25,13 +27,22 @@ void stream_events(struct bufferevent *bev, short what, void *raw)
     assert(bev==self->sock_bev);
     if(what&(BEV_EVENT_EOF))
     {
-        if(what&BEV_EVENT_READING) { // end of user to sock
+        //libevent <=2.1 doesn't correctly map read/write events
+        // with paired bufferevents.
+        // eg. EV_WRITE isn't translated to BEV_EVENT_WRITING
+        // eg. BEV_EVENT_WRITING isn't flipped to BEV_EVENT_READING
+        if(what&EV_WRITE) { // end of user to sock (should be BEV_EVENT_READING)
             self->txeoi = true;
             bufferevent_disable(bev, EV_READ);
+            self->tx_resume();
         }
-        if(what&BEV_EVENT_WRITING) { // end of sock to user
+        if(what&EV_READ) { // end of sock to user (should be BEV_EVENT_WRITING)
             self->rxeoi = true;
         }
+    }
+    if(what&BEV_EVENT_ERROR)
+    {
+        printf("!!!stream BEV error %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
     }
 }
 
@@ -42,12 +53,7 @@ void stream_user_to_sock(struct bufferevent *bev, void *raw)
     assert(bev==self->sock_bev);
 
     // writing data to stream
-    if(self->txpaused) {
-        if(nghttp2_session_resume_data(self->sock->h2sess, self->streamid))
-            fprintf(stderr, "%s: error resuming stream\n", self->sock->myname.c_str());
-        else
-            self->sock->queue_deferred_send();
-    }
+    self->tx_resume();
 }
 
 namespace H2 {
@@ -92,6 +98,18 @@ RawRequest::~RawRequest()
     if(sock_bev) bufferevent_free(sock_bev);
     if(user_bev) bufferevent_free(user_bev);
     delete user;
+}
+
+void RawRequest::tx_resume()
+{
+    if(txpaused) {
+        if(nghttp2_session_resume_data(sock->h2sess, streamid))
+            fprintf(stderr, "%s: error resuming stream\n", sock->myname.c_str());
+        else {
+            printf("%s: resume stream %d %p\n", sock->myname.c_str(), streamid, this);
+            sock->queue_deferred_send();
+        }
+    }
 }
 
 } // namespace H2

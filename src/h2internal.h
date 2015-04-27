@@ -34,6 +34,7 @@ struct RawRequest
         user = s;
         s->req = this;
     }
+    void tx_resume();
 
     virtual void handle_pseudo_header(const std::string& name, const std::string& value) {}
     virtual void end_of_headers()=0;
