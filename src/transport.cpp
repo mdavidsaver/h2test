@@ -521,14 +521,19 @@ ssize_t Transport::stream_write(nghttp2_session *session, int32_t stream_id,
     size_t blen = evbuffer_get_length(ebuf);
 
     if(req->txeoi) {
-        printf("EOF\n");
+        printf("EOF ");
         *data_flags = NGHTTP2_DATA_FLAG_EOF;
-        return 0;
+
     } else if(req->txpaused || blen==0) {
         printf("Pause\n");
         req->txpaused = true;
         return NGHTTP2_ERR_DEFERRED;
     }
+    if(blen==0) {
+        printf("length==0\n");
+        return 0;
+    }
+
     size_t tosend = std::min(length, blen);
     ssize_t nsent = evbuffer_copyout(ebuf, buf, tosend);
     if(nsent<0) {

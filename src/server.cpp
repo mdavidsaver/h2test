@@ -91,6 +91,8 @@ struct ServerRequest : H2::RawRequest
 
     virtual void end_of_data()
     {
+        if(!rxeoi)
+            bufferevent_flush(sock_bev, EV_WRITE, BEV_FINISHED);
         rxeoi = true;
         if(user) {
             user->closed();

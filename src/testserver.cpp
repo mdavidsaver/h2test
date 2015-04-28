@@ -126,6 +126,78 @@ class CountTick : public H2::Handler
 public:
     CountTick(event_base *base) :base(base) {}
 };
+
+class Echo : public H2::Handler
+{
+    class Stream : public H2::Stream
+    {
+        bool eoi;
+        void transfer()
+        {
+            evbuffer *inbuf = bufferevent_get_input(bev()),
+                    *outbuf = bufferevent_get_output(bev());
+            size_t inlen = evbuffer_get_length(inbuf),
+                  outlen = evbuffer_get_length(outbuf);
+            size_t totf = std::min(inlen, 128-outlen);
+            if(totf) {
+                evbuffer_remove_buffer(inbuf, outbuf, totf);
+                bufferevent_enable(bev(), EV_WRITE);
+            }
+
+            if(outlen+totf>=128 && !eoi) {
+                // output buffer full
+                bufferevent_disable(bev(), EV_READ);
+            } else {
+                bufferevent_enable(bev(), EV_READ);
+            }
+        }
+
+        static void read_cb(struct bufferevent *bev, void *raw)
+        {
+            Stream *self = (Stream*)raw;
+            self->transfer();
+        }
+        static void write_cb(struct bufferevent *bev, void *raw)
+        {
+            Stream *self = (Stream*)raw;
+            bufferevent_disable(self->bev(), EV_WRITE);
+            self->transfer();
+        }
+        static void event_cb(struct bufferevent *bev, short what, void *raw)
+        {
+            Stream *self = (Stream*)raw;
+            if(what&BEV_EVENT_EOF) {
+                if(what&EV_WRITE) {
+                    // no more input
+                    bufferevent_disable(self->bev(), EV_READ);
+                    self->eoi = true;
+                    bufferevent_flush(self->bev(), EV_WRITE, BEV_FINISHED);
+                }
+            }
+        }
+        virtual void start()
+        {
+            bufferevent_setcb(bev(), read_cb, write_cb, event_cb, this);
+            bufferevent_enable(bev(), EV_READ);
+
+            H2::Stream::headers_t H;
+            H["content-type"] = H2::Stream::headers_t::mapped_type();
+            H["content-type"].push_back("text/ascii");
+            send_headers(200, H);
+        }
+    public:
+        Stream()
+            :eoi(false)
+        {}
+    };
+    virtual ~Echo() {}
+    virtual H2::Stream* build(const H2::RequestInfo &, Config &C)
+    {
+        C.enable_tx();
+        C.enable_rx();
+        return new Stream();
+    }
+};
 } // namespace
 
 int main(int argc, char *argv[])
@@ -143,6 +215,7 @@ int main(int argc, char *argv[])
         serv->set_handler("/hello", new HelloHandle());
         serv->set_handler("/spam", new CountSpam());
         serv->set_handler("/tick", new CountTick(base));
+        serv->set_handler("/echo", new Echo());
 
         H2::EventSignal sigint(base, SIGINT), sigquit(base, SIGQUIT);
 
